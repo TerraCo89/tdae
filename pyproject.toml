@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tdae"
+version = "0.1.0"
+description = "Test-Driven Agent Evolution: ground-truth evaluation, accuracy scoring, and regression tracking for LLM agents"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Kris Cernjavic" }]
+requires-python = ">=3.10"
+keywords = ["llm", "evaluation", "agents", "testing", "ground-truth", "regression"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Testing",
+]
+# Intentionally zero runtime dependencies: the harness is stdlib-only.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4"]
+
+[project.scripts]
+tdae-demo = "tdae.demo:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
