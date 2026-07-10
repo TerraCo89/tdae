@@ -1,5 +1,6 @@
 # TDAE — Test-Driven Agent Evolution
 
+![CI](https://github.com/TerraCo89/tdae/actions/workflows/ci.yml/badge.svg)
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)
 ![Tested with pytest](https://img.shields.io/badge/tested%20with-pytest-0A9EDC.svg)
@@ -72,17 +73,38 @@ No API keys needed — the demo and the full test suite run offline against a
 deterministic `MockLLMProvider`.
 
 ```bash
-git clone <this-repo> tdae && cd tdae
+git clone https://github.com/TerraCo89/tdae && cd tdae
 python -m venv .venv && source .venv/bin/activate   # .venv\Scripts\activate on Windows
 pip install -e ".[dev]"
 
-pytest        # full suite, all offline
+pytest        # 38 tests, all offline, < 1 second
 tdae-demo     # end-to-end demo: baseline run + regression detection
 ```
 
 The demo runs the customer-matching agent over its 6 ground-truth scenarios
 (100% pass), then re-runs with a deliberately broken configuration and shows
-`detect_regressions` catching the drop in pass rate and accuracy.
+`detect_regressions` catching the drop in pass rate and accuracy:
+
+```text
+TDAE GROUND TRUTH TEST SUMMARY
+==============================
+Agent:              customer_matching
+Total Scenarios:    6
+Passed:             6 (100.0%)
+Average Score:      100.00%    (field 100% · price 100%)
+
+Agent performance metrics (baseline):
+  pass_rate: 100.00%   avg_accuracy: 100.00%   error_rate: 0.00%
+
+Re-running suite with a broken configuration (empty customer
+directory) to demonstrate regression detection...
+  broken config pass rate: 0% (baseline was 100%)
+  Regressions detected:
+    - accuracy dropped 30.0% (1.00 -> 0.70)
+    - pass rate dropped 100.0% (1.00 -> 0.00)
+
+Demo result: OK
+```
 
 ## Using the harness
 
