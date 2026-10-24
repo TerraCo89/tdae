@@ -5,23 +5,35 @@ broadcast batch progress over Redis. The showcase replaces both with an
 :class:`InMemoryResultStore` exposing the same analytical surface:
 
 * per-agent :class:`AgentPerformanceMetrics` (pass rate, accuracy, latency,
-  error rate)
+  error rate, token usage and cost)
 * configuration / agent comparison with recommendations
 * regression detection against a baseline
+
+:class:`JsonlResultStore` adds a persistent, append-only ledger (one JSON line
+per execution), so a baseline from an earlier run can be loaded back and
+compared by ``run_id``.
 """
 
 from __future__ import annotations
 
+import dataclasses
+import json
 import statistics
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
 
 
 @dataclass
 class TestExecutionRecord:
-    """One scenario execution by one agent (or agent configuration)."""
+    """One scenario execution by one agent (or agent configuration).
+
+    The fields after ``executed_at`` are optional run metadata: which
+    evaluation run and suite the execution belongs to, which model the agent
+    used, and what it cost.
+    """
 
     __test__ = False  # not a pytest test class, despite the name
 
@@ -36,6 +48,22 @@ class TestExecutionRecord:
     executed_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
+    run_id: Optional[str] = None
+    suite: Optional[str] = None
+    model: Optional[str] = None
+    input_tokens: Optional[int] = None
+    output_tokens: Optional[int] = None
+    cost_usd: Optional[float] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return dataclasses.asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "TestExecutionRecord":
+        """Build a record from :meth:`to_dict` output; unknown keys are ignored."""
+        known = {f.name for f in dataclasses.fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in known})
 
 
 @dataclass
@@ -54,6 +82,11 @@ class AgentPerformanceMetrics:
     last_updated: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
+    # Usage totals over the executions that reported them (0 when none did).
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    total_cost_usd: float = 0.0
+    avg_cost_usd: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -67,6 +100,12 @@ class AgentPerformanceMetrics:
                 "min": self.min_response_time_ms,
                 "max": self.max_response_time_ms,
                 "stddev": self.stddev_response_time_ms,
+            },
+            "usage": {
+                "total_input_tokens": self.total_input_tokens,
+                "total_output_tokens": self.total_output_tokens,
+                "total_cost_usd": self.total_cost_usd,
+                "avg_cost_usd": self.avg_cost_usd,
             },
             "last_updated": self.last_updated,
         }
@@ -90,25 +129,42 @@ class InMemoryResultStore:
         agent_name: Optional[str] = None,
         scenario_id: Optional[str] = None,
         limit: Optional[int] = None,
+        run_id: Optional[str] = None,
+        suite: Optional[str] = None,
     ) -> List[TestExecutionRecord]:
         results = [
             r
             for r in self._records
             if (agent_name is None or r.agent_name == agent_name)
             and (scenario_id is None or r.scenario_id == scenario_id)
+            and (run_id is None or r.run_id == run_id)
+            and (suite is None or r.suite == suite)
         ]
         if limit is not None:
             results = results[-limit:]
         return results
+
+    def run_ids(self) -> List[str]:
+        """Distinct run IDs in the order they first appear."""
+        return list(dict.fromkeys(r.run_id for r in self._records if r.run_id is not None))
 
     def __len__(self) -> int:
         return len(self._records)
 
     # -- analytics ----------------------------------------------------------
 
-    def metrics_for(self, agent_name: str) -> AgentPerformanceMetrics:
-        """Compute aggregated performance metrics for one agent."""
-        records = self.records(agent_name=agent_name)
+    def metrics_for(
+        self,
+        agent_name: str,
+        run_id: Optional[str] = None,
+        suite: Optional[str] = None,
+    ) -> AgentPerformanceMetrics:
+        """Compute aggregated performance metrics for one agent.
+
+        ``run_id`` / ``suite`` narrow the records, so a ledger holding many
+        runs can yield the metrics of one (e.g. the stored baseline).
+        """
+        records = self.records(agent_name=agent_name, run_id=run_id, suite=suite)
         total = len(records)
         if total == 0:
             return AgentPerformanceMetrics(
@@ -123,6 +179,7 @@ class InMemoryResultStore:
         passed = sum(1 for r in records if r.result == "pass")
         errors = sum(1 for r in records if r.result == "error")
         latencies = [r.execution_time_ms for r in records]
+        costs = [r.cost_usd for r in records if r.cost_usd is not None]
 
         return AgentPerformanceMetrics(
             agent_name=agent_name,
@@ -136,6 +193,10 @@ class InMemoryResultStore:
             stddev_response_time_ms=(
                 statistics.pstdev(latencies) if len(latencies) > 1 else 0.0
             ),
+            total_input_tokens=sum(r.input_tokens or 0 for r in records),
+            total_output_tokens=sum(r.output_tokens or 0 for r in records),
+            total_cost_usd=sum(costs),
+            avg_cost_usd=sum(costs) / len(costs) if costs else 0.0,
         )
 
     def compare(
@@ -145,14 +206,22 @@ class InMemoryResultStore:
         accuracy_threshold: float = 0.05,
         latency_threshold_ms: float = 50.0,
         pass_rate_threshold: float = 0.10,
+        run_id_a: Optional[str] = None,
+        run_id_b: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Compare two agents/configurations and generate recommendations.
 
         Mirrors the production ``compare_configurations`` tool: differences
-        below the thresholds are treated as noise.
+        below the thresholds are treated as noise. ``run_id_a`` / ``run_id_b``
+        compare specific runs (including two runs of the same agent); the
+        sides are then labelled ``"<agent>@<run_id>"``.
         """
-        metrics_a = self.metrics_for(agent_a)
-        metrics_b = self.metrics_for(agent_b)
+        metrics_a = self.metrics_for(agent_a, run_id=run_id_a)
+        metrics_b = self.metrics_for(agent_b, run_id=run_id_b)
+        if run_id_a is not None:
+            agent_a = f"{agent_a}@{run_id_a}"
+        if run_id_b is not None:
+            agent_b = f"{agent_b}@{run_id_b}"
 
         comparison: Dict[str, Any] = {}
         recommendations: List[str] = []
@@ -204,6 +273,38 @@ class InMemoryResultStore:
             "comparison": comparison,
             "recommendations": recommendations,
         }
+
+
+class JsonlResultStore(InMemoryResultStore):
+    """A result store backed by an append-only JSON Lines file.
+
+    Every :meth:`add` appends one line (UTF-8, non-ASCII kept readable), and
+    opening an existing file loads its records, so the ledger accumulates
+    across runs. All read and analytics methods are inherited from
+    :class:`InMemoryResultStore`.
+    """
+
+    def __init__(self, path: Union[str, Path]) -> None:
+        super().__init__()
+        self.path = Path(path)
+        if self.path.exists():
+            with self.path.open(encoding="utf-8") as handle:
+                for line_number, line in enumerate(handle, start=1):
+                    if not line.strip():
+                        continue
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError as exc:
+                        raise ValueError(
+                            f"{self.path}:{line_number}: not valid JSON ({exc.msg})"
+                        ) from exc
+                    self._records.append(TestExecutionRecord.from_dict(data))
+
+    def add(self, record: TestExecutionRecord) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record.to_dict(), ensure_ascii=False) + "\n")
+        super().add(record)
 
 
 def detect_regressions(

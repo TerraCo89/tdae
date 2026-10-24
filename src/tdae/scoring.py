@@ -1,6 +1,6 @@
 """Accuracy scoring for agent outputs against ground-truth scenarios.
 
-Two scoring layers:
+Scoring layers:
 
 * :func:`calculate_accuracy_score` - a generic per-field accuracy score with
   numeric tolerance and fuzzy string matching (used by the batch runner for
@@ -8,11 +8,26 @@ Two scoring layers:
 * :class:`TestResultValidator` - the scenario-aware validator that produces a
   weighted validation report (field accuracy, price accuracy, completeness,
   critical validations) and the final pass/fail verdict.
+* :class:`Scorer` - the protocol the orchestrator scores through.
+  :class:`FreightScorer` (the default) wraps :class:`TestResultValidator`;
+  other domains plug in their own scorer.
+* Domain-neutral helpers for writing scorers: :func:`within_tolerance`,
+  :func:`fact_check` and :func:`precision_recall`.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Protocol,
+    Sequence,
+    runtime_checkable,
+)
 
 # Overall score at or above this threshold counts as a pass.
 PASS_THRESHOLD = 0.85
@@ -253,3 +268,176 @@ class TestResultValidator:
             if isinstance(v, dict):
                 keys.update(TestResultValidator._get_all_keys(v, new_key))
         return keys
+
+
+# ---------------------------------------------------------------------------
+# Pluggable scoring
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class Scorer(Protocol):
+    """Scores one agent output against one scenario.
+
+    ``score`` must return a dict with at least ``overall_score`` (0.0-1.0) and
+    ``passed`` (bool). Any other keys are kept in the scenario report, so a
+    scorer can return whatever detail its domain needs.
+    """
+
+    def score(self, scenario: Dict[str, Any], agent_output: Dict[str, Any]) -> Dict[str, Any]:
+        ...
+
+
+class FreightScorer:
+    """The default scorer: the weighted freight validation report.
+
+    Behaves exactly like :meth:`TestResultValidator.generate_validation_report`;
+    ``pass_threshold`` only changes the pass/fail verdict.
+    """
+
+    def __init__(self, pass_threshold: float = PASS_THRESHOLD) -> None:
+        self.pass_threshold = pass_threshold
+
+    def score(self, scenario: Dict[str, Any], agent_output: Dict[str, Any]) -> Dict[str, Any]:
+        report = TestResultValidator.generate_validation_report(scenario, agent_output)
+        report["passed"] = report["overall_score"] >= self.pass_threshold
+        return report
+
+
+# ---------------------------------------------------------------------------
+# Domain-neutral helpers for writing scorers
+# ---------------------------------------------------------------------------
+
+
+def within_tolerance(
+    expected: float,
+    actual: Any,
+    *,
+    rel_tol: Optional[float] = None,
+    abs_tol: Optional[float] = None,
+) -> bool:
+    """True if ``actual`` is within tolerance of ``expected``.
+
+    The allowed difference is the larger of ``rel_tol * |expected|`` and
+    ``abs_tol`` (the same rule as :func:`math.isclose`). With neither given,
+    the values must be equal. Non-numeric ``actual`` values never match.
+    """
+    if isinstance(actual, bool) or not isinstance(actual, (int, float)):
+        return False
+    allowed = max(
+        (rel_tol or 0.0) * abs(expected),
+        abs_tol or 0.0,
+    )
+    return abs(expected - actual) <= allowed
+
+
+def _lookup(data: Mapping[str, Any], path: str) -> Any:
+    """Resolve a dotted path (``"fit.center"``) in nested dicts; raises KeyError."""
+    value: Any = data
+    for part in path.split("."):
+        if not isinstance(value, Mapping) or part not in value:
+            raise KeyError(path)
+        value = value[part]
+    return value
+
+
+def fact_check(
+    expected_facts: Mapping[str, Any],
+    output: Mapping[str, Any],
+    tolerances: Optional[Mapping[str, Mapping[str, float]]] = None,
+) -> Dict[str, bool]:
+    """Check each expected fact against an agent output; one verdict per fact.
+
+    Keys of ``expected_facts`` are dotted paths into ``output``
+    (``"facts.rabi_freq_khz"``). How each fact is compared:
+
+    * numbers - :func:`within_tolerance`, using ``tolerances[path]``
+      (``{"rel_tol": ..., "abs_tol": ...}``) when given, else exact
+    * lists / sets - every expected item must be present (extras are allowed,
+      so "cites runs 112 and 140" passes when a third run is also cited)
+    * strings - case- and whitespace-insensitive equality
+    * anything else - equality
+
+    A fact whose path is missing from ``output`` fails.
+    """
+    tolerances = tolerances or {}
+    verdicts: Dict[str, bool] = {}
+    for path, expected in expected_facts.items():
+        try:
+            actual = _lookup(output, path)
+        except KeyError:
+            verdicts[path] = False
+            continue
+
+        if isinstance(expected, (int, float)) and not isinstance(expected, bool):
+            verdicts[path] = within_tolerance(expected, actual, **dict(tolerances.get(path, {})))
+        elif isinstance(expected, (list, tuple, set, frozenset)):
+            if not isinstance(actual, (list, tuple, set, frozenset)):
+                verdicts[path] = False
+            else:
+                verdicts[path] = all(item in actual for item in expected)
+        elif isinstance(expected, str) and isinstance(actual, str):
+            verdicts[path] = expected.strip().lower() == actual.strip().lower()
+        else:
+            verdicts[path] = expected == actual
+    return verdicts
+
+
+def precision_recall(
+    expected: Sequence[Any],
+    found: Sequence[Any],
+    match: Optional[Callable[[Any, Any], bool]] = None,
+) -> Dict[str, Any]:
+    """Precision / recall of ``found`` items against ``expected`` items.
+
+    Each expected item can be matched by at most one found item and vice
+    versa; the pairing maximises the number of matches. ``match(expected,
+    found)`` decides whether two items correspond (default: equality), e.g.
+    "alert of the right kind within 30 minutes of the injected event".
+
+    Conventions: precision is 1.0 when nothing was found, recall is 1.0 when
+    nothing was expected (an empty window with no alerts is a perfect score).
+
+    Returns ``precision``, ``recall``, ``f1``, the ``true_positives`` /
+    ``false_positives`` / ``false_negatives`` counts and ``matches`` as a
+    list of ``(expected_index, found_index)`` pairs.
+    """
+    match = match or (lambda e, f: e == f)
+    candidates = [
+        [j for j, f in enumerate(found) if match(e, f)] for e in expected
+    ]
+    found_to_expected: Dict[int, int] = {}
+
+    def assign(i: int, seen: set) -> bool:
+        # Augmenting-path step of Kuhn's bipartite matching algorithm.
+        for j in candidates[i]:
+            if j in seen:
+                continue
+            seen.add(j)
+            if j not in found_to_expected or assign(found_to_expected[j], seen):
+                found_to_expected[j] = i
+                return True
+        return False
+
+    for i in range(len(expected)):
+        assign(i, set())
+
+    tp = len(found_to_expected)
+    fp = len(found) - tp
+    fn = len(expected) - tp
+    precision = tp / len(found) if found else 1.0
+    recall = tp / len(expected) if expected else 1.0
+    f1 = (
+        2 * precision * recall / (precision + recall)
+        if (precision + recall) > 0
+        else 0.0
+    )
+    return {
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "true_positives": tp,
+        "false_positives": fp,
+        "false_negatives": fn,
+        "matches": sorted((i, j) for j, i in found_to_expected.items()),
+    }

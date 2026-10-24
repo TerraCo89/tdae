@@ -28,6 +28,12 @@ partially correct, and non-binary. TDAE's answer:
 - **Regression tracking** — compare agent configurations head-to-head and
   diff a current run against a stored baseline; wire `detect_regressions`
   into CI to block degrading changes.
+- **Any domain** — the freight scorer is the default, not a requirement: plug
+  in your own `Scorer`, built on the `within_tolerance`, `fact_check` and
+  `precision_recall` helpers.
+- **Cost and run ledger** — agents can report model, tokens and cost per
+  scenario; `JsonlResultStore` keeps every execution in an append-only file
+  so a baseline from last week's run can gate today's.
 
 ## Architecture
 
@@ -77,7 +83,7 @@ git clone https://github.com/TerraCo89/tdae && cd tdae
 python -m venv .venv && source .venv/bin/activate   # .venv\Scripts\activate on Windows
 pip install -e ".[dev]"
 
-pytest        # 38 tests, all offline, < 1 second
+pytest        # 78 tests, all offline, < 1 second
 tdae-demo     # end-to-end demo: baseline run + regression detection
 ```
 
@@ -142,13 +148,71 @@ regressions = detect_regressions(baseline_metrics, current_metrics)
 assert not regressions, f"Agent regressed: {regressions}"
 ```
 
+## Custom scorers and domains
+
+The orchestrator scores through a `Scorer`: anything with
+`score(scenario, agent_output) -> dict` returning at least `overall_score`
+(0–1) and `passed`. Extra keys stay in the per-scenario report. The default is
+`FreightScorer`, the weighted freight report above.
+
+Here a lab-analysis agent is scored on a fitted value (within 5%), the runs
+it cites, and the language of its answer. Results go to a JSONL ledger tagged
+with a run ID:
+
+```python
+from tdae import JsonlResultStore, TDAEOrchestrator, detect_regressions, fact_check
+
+
+class FactScorer:
+    def score(self, scenario, agent_output):
+        verdicts = fact_check(
+            scenario["expected_output"],
+            agent_output,
+            tolerances={"facts.rabi_freq_khz": {"rel_tol": 0.05}},
+        )
+        return {
+            "overall_score": sum(verdicts.values()) / len(verdicts),
+            "passed": all(verdicts.values()),
+            "verdicts": verdicts,
+        }
+
+
+scenario = {
+    "scenario_id": "ASK_JA_001",
+    "question": "昨日のラビ周波数はなぜ変わった？",
+    "expected_output": {
+        "facts.rabi_freq_khz": 71.0,
+        "cited_runs": [112, 140],   # lists: every expected item must be cited
+        "language": "ja",
+    },
+}
+
+store = JsonlResultStore("evals/results/runs.jsonl")
+orchestrator = TDAEOrchestrator(store=store, scorer=FactScorer(), run_id="2026-10-25", suite="ask")
+summary = orchestrator.run_suite(my_agent, [scenario])
+
+# Next week, gate a new prompt or model against this run:
+regressions = detect_regressions(
+    store.metrics_for(my_agent.name, run_id="2026-10-25"),
+    store.metrics_for(my_agent.name, run_id="2026-11-01"),
+)
+```
+
+An agent reports usage by adding
+`"_usage": {"model": ..., "input_tokens": ..., "output_tokens": ..., "cost_usd": ...}`
+to its output. TDAE strips it before scoring, records it on the execution, and
+totals it in the suite summary and `metrics_for(...)`. For event detection
+(alerts versus known incidents), `precision_recall(expected, found, match=...)`
+pairs items one to one, with a custom `match` such as "same kind, within 30
+minutes".
+
 ## Repository layout
 
 ```
 src/tdae/                    # the harness
   ground_truth.py            # 36 synthetic scenarios + ValidationMetrics
-  scoring.py                 # accuracy scoring + weighted validation reports
-  metrics.py                 # result store, per-agent metrics, regression detection
+  scoring.py                 # Scorer protocol, FreightScorer, scoring helpers
+  metrics.py                 # result stores (memory, JSONL), per-agent metrics, regressions
   orchestrator.py            # batch evaluation loop
   providers.py               # LLMProvider protocol + Mock/Scripted providers
   demo.py                    # offline end-to-end demo (tdae-demo)
